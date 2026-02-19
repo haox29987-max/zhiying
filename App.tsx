@@ -1,5 +1,4 @@
-
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { AnalysisJob, UserData, AllowedUser } from './types';
 import Header from './components/Header';
 import AnalysisForm from './components/AnalysisForm';
@@ -9,6 +8,9 @@ import LoginForm from './components/LoginForm';
 import AdminPortal from './components/AdminPortal';
 import TrashManager from './components/TrashManager';
 import { LayoutDashboard, Trash2 } from 'lucide-react';
+
+// 配置你的后端 API 地址。如果在其他电脑访问，请将 localhost 替换为你这台主机的内网 IP
+const API_BASE = 'http://localhost:8000';
 
 const App: React.FC = () => {
   const [currentUser, setCurrentUser] = useState<UserData | null>(null);
@@ -22,20 +24,56 @@ const App: React.FC = () => {
     return saved ? JSON.parse(saved) : [];
   });
 
-  const [jobs, setJobs] = useState<AnalysisJob[]>(() => {
-    const saved = localStorage.getItem('cf_jobs');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [jobs, setJobs] = useState<AnalysisJob[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
+  const pollIntervalRef = useRef<number | null>(null);
 
   useEffect(() => {
     localStorage.setItem('cf_allowed_users', JSON.stringify(allowedUsers));
   }, [allowedUsers]);
 
+  // 从后端获取当前用户的任务列表
+  const fetchJobs = async () => {
+    if (!currentUser) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/jobs?username=${encodeURIComponent(currentUser.username)}`);
+      if (res.ok) {
+        const data = await res.json();
+        
+        // 拼接完整的视频局域网地址
+        const updatedJobs = data.jobs.map((job: any) => {
+          if (job.video_rel_path && !job.video_rel_path.startsWith('http')) {
+             job.video_rel_path = `${API_BASE}${job.video_rel_path}`;
+          }
+          return job;
+        });
+        
+        setJobs(updatedJobs);
+      }
+    } catch (err) {
+      console.error("Failed to fetch jobs from server", err);
+    }
+  };
+
+  // 轮询机制：如果用户在线且有任务处于处理状态，每3秒同步一次数据
   useEffect(() => {
-    localStorage.setItem('cf_jobs', JSON.stringify(jobs));
-  }, [jobs]);
+    if (currentUser && jobs.some(j => j.status !== 'completed' && j.status !== 'failed')) {
+      pollIntervalRef.current = window.setInterval(fetchJobs, 3000);
+    } else {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    }
+    return () => {
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+    };
+  }, [currentUser, jobs]);
+
+  // 初始加载当前用户的任务
+  useEffect(() => {
+    if (currentUser && !isLoggedInAsAdmin) {
+      fetchJobs();
+    }
+  }, [currentUser]);
 
   const activeJobs = useMemo(() => jobs.filter(j => !j.deletedAt), [jobs]);
   const trashJobs = useMemo(() => jobs.filter(j => !!j.deletedAt), [jobs]);
@@ -62,80 +100,76 @@ const App: React.FC = () => {
     setCurrentUser(null);
     setIsLoggedInAsAdmin(false);
     setIsAdminMode(false);
+    setJobs([]);
   };
 
-  const startAnalysis = (inputs: { urls: string[], model: string }) => {
+  const handleLogin = async (user: UserData, mode: 'employee' | 'admin') => {
+    try {
+      // 登录时通知后端建立 D 盘专属文件夹
+      await fetch(`${API_BASE}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: user.username, mode })
+      });
+      
+      if (mode === 'admin') {
+        setIsLoggedInAsAdmin(true);
+      } else {
+        setCurrentUser(user);
+      }
+    } catch (err) {
+      alert("无法连接到内网服务器，请检查服务端是否运行！");
+    }
+  };
+
+  const startAnalysis = async (inputs: { urls: string[], model: string }) => {
+    if (!currentUser) return;
     setIsProcessing(true);
-    const newJobs: AnalysisJob[] = inputs.urls.map((url, i) => ({
-      id: `url-${Date.now()}-${i}`,
-      filename: `Video_${url.split('/').pop()?.slice(-6) || 'Clip'}.mp4`,
-      status: 'pending' as const,
-      progress: 0,
-      metadata: { url } as any
-    }));
-    setJobs(prev => [...newJobs, ...prev]);
-    newJobs.forEach(job => simulateJobProcess(job.id));
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          urls: inputs.urls,
+          model: inputs.model,
+          username: currentUser.username
+        })
+      });
+      
+      if (res.ok) {
+        fetchJobs(); // 立即刷新任务列表，让其进入 pending/scraping 状态
+      }
+    } catch (error) {
+      alert("提交任务失败，请检查内网连接。");
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
-  const simulateJobProcess = (jobId: string) => {
-    const steps: Array<AnalysisJob['status']> = ['scraping', 'downloading', 'analyzing', 'completed'];
-    let currentStepIndex = 0;
-    const interval = setInterval(() => {
-      setJobs(prev => prev.map(j => {
-        if (j.id === jobId) {
-          const nextStep = steps[currentStepIndex];
-          const isDone = currentStepIndex === steps.length - 1;
-          if (isDone) {
-            clearInterval(interval);
-            return {
-              ...j, status: 'completed', progress: 100,
-              video_rel_path: 'https://www.w3schools.com/html/mov_bbb.mp4',
-              metadata: {
-                url: 'https://www.tiktok.com/@example/video/123456',
-                author: '乘风特约创作者',
-                fans: '1.2M+',
-                publish_time: '2024-03-22',
-                desc: '乘风智影深度分析案例：爆款视频的底层叙事逻辑。',
-                music: '原声 - 乘风媒体库',
-                category: '商业 / 增长',
-                sub_tag: '案例研究',
-                product_id: 'CF-8892',
-                stats: { play: 1250000, digg: 68000, comment: 2400, share: 1500, collect: 8900 }
-              },
-              analysis: {
-                score: "92",
-                short_summary: "极致的情绪曲线引导",
-                detail_summary: "该视频通过极简的视觉对齐和快速的音频切分，构建了一个完整的情绪闭环。",
-                suggestions: "1. 视频第12秒处可以增加醒目的文字弹窗以增强记忆点。"
-              },
-              segments: [
-                {
-                  start_str: "00:00", end_str: "00:04", start_sec: 0, end_sec: 4,
-                  origin: "Sticking ideas", trans: "想法深入人心",
-                  visual: "动态文字浮现", gif_path: "https://picsum.photos/360/200?random=11"
-                }
-              ]
-            };
-          }
-          currentStepIndex++;
-          return { ...j, status: nextStep, progress: (currentStepIndex / steps.length) * 100 };
-        }
-        return j;
-      }));
-    }, 2000);
-  };
-
-  const moveToTrash = (id: string) => {
-    setJobs(prev => prev.map(j => j.id === id ? { ...j, deletedAt: Date.now() } : j));
-    if (selectedJobId === id) setSelectedJobId(null);
+  const moveToTrash = async (id: string) => {
+    if (!currentUser) return;
+    try {
+      await fetch(`${API_BASE}/api/jobs/${id}/trash`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: currentUser.username })
+      });
+      fetchJobs(); // 刷新数据
+      if (selectedJobId === id) setSelectedJobId(null);
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   const restoreJob = (id: string) => {
+    // 逻辑同上，需后端提供 /api/jobs/{id}/restore，此处为前端更新演示
     setJobs(prev => prev.map(j => j.id === id ? { ...j, deletedAt: undefined } : j));
   };
 
   const permanentDelete = (id: string) => {
-    if (confirm('确定要永久粉碎此任务吗？此操作无法撤销。')) {
+    if (confirm('确定要永久粉碎此任务吗？此操作无法撤销，并将删除D盘对应的物理文件。')) {
+      // 需通知后端物理删除文件夹
       setJobs(prev => prev.filter(j => j.id !== id));
       if (selectedJobId === id) setSelectedJobId(null);
     }
@@ -164,10 +198,7 @@ const App: React.FC = () => {
       <LoginForm 
         mode="admin" 
         allowedUsers={allowedUsers}
-        onLogin={(user) => {
-          if (user.username === '超级管理员') setIsLoggedInAsAdmin(true);
-          else setCurrentUser(user);
-        }} 
+        onLogin={(user) => handleLogin(user, 'admin')} 
         onCancel={() => setIsAdminMode(false)} 
       />
     );
@@ -178,7 +209,7 @@ const App: React.FC = () => {
       <LoginForm 
         mode="employee" 
         allowedUsers={allowedUsers}
-        onLogin={setCurrentUser} 
+        onLogin={(user) => handleLogin(user, 'employee')} 
         onLogoClick={handleLogoClick} 
       />
     );
@@ -190,7 +221,6 @@ const App: React.FC = () => {
       
       <main className="container mx-auto px-6 mt-12 max-w-[1400px]">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-10">
-          {/* Left Column: Form and Mini Nav (Wider) */}
           <div className="lg:col-span-5 space-y-8">
             <AnalysisForm 
               onStart={startAnalysis} 
@@ -225,7 +255,6 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Right Column: Viewport */}
           <div className="lg:col-span-7">
             {viewMode === 'active' ? (
               selectedJob ? (
